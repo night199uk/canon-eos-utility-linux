@@ -85,3 +85,54 @@ def test_read_mp4_creation_time(tmp_path):
     metadata = read_metadata(str(movie))
     assert metadata.source == "mp4"
     assert metadata.taken == datetime.datetime(2023, 11, 14, 22, 13, 20)
+
+
+def _tiff_with_exif(path) -> bytes:
+    from PIL import Image
+
+    image = Image.new("RGB", (10, 10))
+    exif = image.getexif()
+    exif[0x0110] = "Canon EOS R5"
+    exif[0x0132] = "2026:09:12 15:06:05"
+    image.save(str(path), "TIFF", exif=exif)
+    return path.read_bytes()
+
+
+def test_wrap_tiff_as_app1_truncates_oversized_tiff():
+    from canon_eos_utility.metadata import _wrap_tiff_as_app1
+
+    # A CMT box can be far larger than the 16-bit APP1 length field allows.
+    wrapped = _wrap_tiff_as_app1(b"\x00" * (100 * 1024))
+
+    assert wrapped[:2] == b"\xff\xe1"
+    # marker (2) + length (2) + payload (<= 65535) + EOI (2)
+    assert len(wrapped) <= 2 + 0xFFFF + 2
+
+
+def test_read_cr3_with_oversized_cmt_box(tmp_path):
+    tiff = _tiff_with_exif(tmp_path / "tiff")
+
+    # Simulate a CMT1 box whose TIFF carries > 64 KiB of trailing image data.
+    body = tiff + b"\x00" * (70 * 1024)
+    box = (len(body) + 8).to_bytes(4, "big") + b"CMT1" + body
+    container = b"\x00\x00\x00\x18ftypcrx " + box
+    cr3 = tmp_path / "big.CR3"
+    cr3.write_bytes(container)
+
+    metadata = read_metadata(str(cr3))  # must not raise struct.error
+    assert metadata.source == "cr3"
+    assert metadata.model == "Canon EOS R5"
+    assert metadata.taken == datetime.datetime(2026, 9, 12, 15, 6, 5)
+
+
+def test_read_large_tiff_without_overflow(tmp_path):
+    tiff = _tiff_with_exif(tmp_path / "tiff")
+
+    # A CR2 (or any raw TIFF) is far larger than the APP1 length field allows;
+    # it is wrapped whole, so this reproduces the same 16-bit overflow.
+    cr2 = tmp_path / "big.CR2"
+    cr2.write_bytes(tiff + b"\x00" * (5 * 1024 * 1024))
+
+    metadata = read_metadata(str(cr2))  # must not raise struct.error
+    assert metadata.source == "exif"
+    assert metadata.model == "Canon EOS R5"

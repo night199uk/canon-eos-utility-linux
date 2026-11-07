@@ -229,8 +229,16 @@ def _find_box(data: bytes, box_type: bytes) -> bytes | None:
 
 
 def _wrap_tiff_as_app1(tiff: bytes) -> bytes:
-    """Wrap a raw TIFF block in a minimal APP1 segment the ``exif`` lib accepts."""
-    segment = _EXIF_HEADER + tiff
+    """Wrap a raw TIFF block in a minimal APP1 segment the ``exif`` lib accepts.
+
+    The JPEG EXIF APP1 length field is 16-bit, so only the first part of a large
+    TIFF can be wrapped.  CR3 ``CMT`` boxes routinely exceed 64 KiB (they embed
+    preview image data), but the metadata IFDs sit at the start, so trailing
+    data can be dropped safely: tags whose values fall past the cut are simply
+    skipped by :func:`_collect_tags`.
+    """
+    max_tiff = 0xFFFF - len(_EXIF_HEADER) - 2
+    segment = _EXIF_HEADER + tiff[:max_tiff]
     return b"\xff\xe1" + struct.pack(">H", len(segment)) + segment + b"\xff\xd9"
 
 
