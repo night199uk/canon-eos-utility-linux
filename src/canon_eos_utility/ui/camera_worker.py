@@ -53,6 +53,9 @@ DOWNLOAD_MAX_RECOVER = 20
 CAPTURE_WAIT_SECONDS = 15.0
 CAPTURE_POLL_INTERVAL = 0.5
 
+#: How many camera objects to read and show per gallery page.
+GALLERY_BATCH_SIZE = 100
+
 
 @dataclass
 class FileConflict:
@@ -92,6 +95,10 @@ class CameraWorker(QObject):
     objectsLoaded = Signal(object)  # [CameraObject]
     thumbnailReady = Signal(object, bytes)
     objectAdded = Signal(object)
+    #: Emitted before a (re)load's first page so the gallery can clear itself.
+    galleryReset = Signal()
+    #: Emitted after each page with whether older objects remain to be loaded.
+    hasMoreObjects = Signal(bool)
 
     downloadProgress = Signal(int, int, str)
     downloadBytes = Signal(object, object)
@@ -127,6 +134,12 @@ class CameraWorker(QObject):
         self._camera_context: dict = {}
         self._overwrite_policy = POLICY_ASK
         self._batch_objects: list[CameraObject] = []
+
+        #: Gallery paging state: all object handles (newest first) and the
+        #: index of the next one to read.  Both are only touched by the worker
+        #: thread.
+        self._gallery_handles: list[int] = []
+        self._gallery_index = 0
 
         self._commands: queue.Queue = queue.Queue()
         self._stop = threading.Event()
@@ -172,6 +185,10 @@ class CameraWorker(QObject):
 
     def refresh_gallery(self) -> None:
         self._submit(self._do_load_gallery)
+
+    def load_more_objects(self) -> None:
+        """Load the next page of older objects into the gallery."""
+        self._submit(self._do_load_more)
 
     def set_property(self, code: int, value: int) -> None:
         self._submit(lambda: self._do_set_property(code, value))
@@ -342,12 +359,67 @@ class CameraWorker(QObject):
         if self.client is None:
             return
         self.statusChanged.emit("Reading camera contents…")
-        objects = self.client.list_objects()
-        media = [obj for obj in objects if obj.is_image or obj.is_movie]
-        self.objectsLoaded.emit(media)
+        try:
+            handles = self.client.list_object_handles()
+        except (CameraError, TransportError) as exc:
+            self.errorOccurred.emit(f"Could not read the camera's contents: {exc}")
+            return
+        # Canon assigns increasing object handles as files are written, so
+        # descending order shows the most recent photos first.
+        handles.sort(reverse=True)
+        self._gallery_handles = handles
+        self._gallery_index = 0
+        self.galleryReset.emit()
+        self._emit_next_gallery_batch()
 
-        loaded = 0
-        for obj in media:
+    def _do_load_more(self) -> None:
+        if not self._gallery_handles or self._gallery_index >= len(self._gallery_handles):
+            self.hasMoreObjects.emit(False)
+            return
+        self.statusChanged.emit("Loading older photos…")
+        self._emit_next_gallery_batch()
+
+    def _emit_next_gallery_batch(self) -> None:
+        """Read and emit the next page of objects, newest first.
+
+        Only the current page's ``GetObjectInfo`` (and thumbnails) are fetched,
+        so a card with thousands of files becomes usable immediately instead of
+        blocking until every object has been read.
+        """
+        if self.client is None:
+            return
+
+        objects: list[CameraObject] = []
+        while self._gallery_index < len(self._gallery_handles) and not objects:
+            end = self._gallery_index + GALLERY_BATCH_SIZE
+            page = self._gallery_handles[self._gallery_index : end]
+            self._gallery_index += len(page)
+            for handle in page:
+                try:
+                    obj = self.client.get_object_info(handle)
+                except (CameraError, TransportError):
+                    continue
+                if obj.is_image or obj.is_movie:
+                    objects.append(obj)
+
+        if objects:
+            self.objectsLoaded.emit(objects)
+            self._load_thumbnails(objects)
+
+        more = self._gallery_index < len(self._gallery_handles)
+        self.hasMoreObjects.emit(more)
+        total = len(self._gallery_handles)
+        if more:
+            self.statusChanged.emit(
+                f"Showing {self._gallery_index} of {total} items — older photos can be loaded"
+            )
+        else:
+            self.statusChanged.emit(f"{total} items on camera")
+
+    def _load_thumbnails(self, objects: list[CameraObject]) -> None:
+        if self.client is None:
+            return
+        for obj in objects:
             if not obj.is_image:
                 continue
             try:
@@ -356,8 +428,6 @@ class CameraWorker(QObject):
                 continue
             if thumbnail:
                 self.thumbnailReady.emit(obj.handle, thumbnail)
-                loaded += 1
-        self.statusChanged.emit(f"{len(media)} items on camera ({loaded} previews)")
 
     def _do_set_property(self, code: int, value: int) -> None:
         if self.client is None:
@@ -388,7 +458,7 @@ class CameraWorker(QObject):
         if self.client is None:
             return set()
         try:
-            return {obj.handle for obj in self.client.list_objects()}
+            return set(self.client.list_object_handles())
         except (CameraError, TransportError):
             return set()
 

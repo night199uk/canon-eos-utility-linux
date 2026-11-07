@@ -307,9 +307,12 @@ class CameraClient:
         obj.handle = handle
         return obj
 
-    def list_objects(self) -> list[CameraObject]:
-        """Return metadata for every object on the camera.
+    def list_object_handles(self) -> list[int]:
+        """Return the handles of every object on the camera.
 
+        Much cheaper than :meth:`list_objects` on a full card: it skips the
+        per-object ``GetObjectInfo`` round trip, so the gallery can page through
+        a large library without blocking on tens of thousands of requests.
         All storages are iterated explicitly because Canon cameras do not honour
         the ``0xFFFFFFFF`` storage wildcard in ``GetObjectHandles``.
         """
@@ -330,9 +333,12 @@ class CameraClient:
                 handles = self.get_object_handles(0xFFFFFFFF)
             except CameraError:
                 handles = []
+        return list(dict.fromkeys(handles))
 
+    def list_objects(self) -> list[CameraObject]:
+        """Return metadata for every object on the camera."""
         objects: list[CameraObject] = []
-        for handle in dict.fromkeys(handles):
+        for handle in self.list_object_handles():
             try:
                 objects.append(self.get_object_info(handle))
             except CameraError:

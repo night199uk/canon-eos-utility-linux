@@ -207,6 +207,7 @@ class MainWindow(QMainWindow):
         self.connection_bar.disconnectRequested.connect(self._disconnect)
 
         self.gallery.refreshRequested.connect(self.worker.refresh_gallery)
+        self.gallery.loadMoreRequested.connect(self.worker.load_more_objects)
         self.gallery.downloadRequested.connect(self._download)
         self.gallery.deleteRequested.connect(self._confirm_delete)
 
@@ -227,7 +228,9 @@ class MainWindow(QMainWindow):
         self.worker.propertiesChanged.connect(self._on_properties_changed)
         self.worker.allowedValuesChanged.connect(self._on_allowed_values_changed)
 
-        self.worker.objectsLoaded.connect(self.gallery.set_objects)
+        self.worker.objectsLoaded.connect(self.gallery.add_objects)
+        self.worker.galleryReset.connect(self.gallery.begin_load)
+        self.worker.hasMoreObjects.connect(self.gallery.set_more_available)
         self.worker.thumbnailReady.connect(self.gallery.set_thumbnail)
         self.worker.objectAdded.connect(self._on_object_added)
 
