@@ -53,9 +53,6 @@ DOWNLOAD_MAX_RECOVER = 20
 CAPTURE_WAIT_SECONDS = 15.0
 CAPTURE_POLL_INTERVAL = 0.5
 
-#: How many camera objects to read and show per gallery page.
-GALLERY_BATCH_SIZE = 100
-
 
 @dataclass
 class FileConflict:
@@ -95,10 +92,10 @@ class CameraWorker(QObject):
     objectsLoaded = Signal(object)  # [CameraObject]
     thumbnailReady = Signal(object, bytes)
     objectAdded = Signal(object)
-    #: Emitted before a (re)load's first page so the gallery can clear itself.
+    #: Emitted before a (re)load so the gallery can clear itself.
     galleryReset = Signal()
-    #: Emitted after each page with whether older objects remain to be loaded.
-    hasMoreObjects = Signal(bool)
+    #: Emitted as objects stream in, with (shown, total) for the summary line.
+    galleryProgress = Signal(int, int)
 
     downloadProgress = Signal(int, int, str)
     downloadBytes = Signal(object, object)
@@ -135,11 +132,13 @@ class CameraWorker(QObject):
         self._overwrite_policy = POLICY_ASK
         self._batch_objects: list[CameraObject] = []
 
-        #: Gallery paging state: all object handles (newest first) and the
-        #: index of the next one to read.  Both are only touched by the worker
-        #: thread.
+        #: Gallery streaming state: all object handles (newest first), the index
+        #: of the next one to read, and whether a stream is in progress.  Only
+        #: touched by the worker thread.
         self._gallery_handles: list[int] = []
         self._gallery_index = 0
+        self._gallery_shown = 0
+        self._gallery_loading = False
 
         self._commands: queue.Queue = queue.Queue()
         self._stop = threading.Event()
@@ -186,10 +185,6 @@ class CameraWorker(QObject):
     def refresh_gallery(self) -> None:
         self._submit(self._do_load_gallery)
 
-    def load_more_objects(self) -> None:
-        """Load the next page of older objects into the gallery."""
-        self._submit(self._do_load_more)
-
     def set_property(self, code: int, value: int) -> None:
         self._submit(lambda: self._do_set_property(code, value))
 
@@ -222,8 +217,14 @@ class CameraWorker(QObject):
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
+                # While streaming the gallery, do not idle-wait for commands:
+                # each loop iteration reads one object and immediately yields
+                # back so events and Live View keep flowing.
+                streaming = (
+                    self._gallery_loading and self.client is not None and self.client.connected
+                )
                 try:
-                    command = self._commands.get(timeout=0.05)
+                    command = self._commands.get(timeout=0 if streaming else 0.05)
                 except queue.Empty:
                     command = None
 
@@ -256,6 +257,7 @@ class CameraWorker(QObject):
         self.client = None
         self._connected_once = False
         self._live_view_enabled = False
+        self._gallery_loading = False
         reason = f" ({exc})" if exc else ""
         if self._pending_downloads:
             self.statusChanged.emit(
@@ -273,6 +275,8 @@ class CameraWorker(QObject):
         if self._live_view_enabled and now >= self._next_live_view_poll:
             self._next_live_view_poll = now + LIVE_VIEW_POLL_INTERVAL
             self._do_poll_live_view()
+        if self._gallery_loading:
+            self._gallery_step()
 
     # -- command implementations ------------------------------------------
 
@@ -365,69 +369,66 @@ class CameraWorker(QObject):
             self.errorOccurred.emit(f"Could not read the camera's contents: {exc}")
             return
         # Canon assigns increasing object handles as files are written, so
-        # descending order shows the most recent photos first.
+        # descending order streams the most recent photos first.
         handles.sort(reverse=True)
         self._gallery_handles = handles
         self._gallery_index = 0
+        self._gallery_shown = 0
+        self._gallery_loading = bool(handles)
         self.galleryReset.emit()
-        self._emit_next_gallery_batch()
-
-    def _do_load_more(self) -> None:
-        if not self._gallery_handles or self._gallery_index >= len(self._gallery_handles):
-            self.hasMoreObjects.emit(False)
+        self.galleryProgress.emit(0, len(handles))
+        if not handles:
+            self.statusChanged.emit("0 items on camera")
             return
-        self.statusChanged.emit("Loading older photos…")
-        self._emit_next_gallery_batch()
+        # Read the first object straight away, then let the worker loop stream
+        # the rest so events and Live View are never blocked for long.
+        self._gallery_step()
 
-    def _emit_next_gallery_batch(self) -> None:
-        """Read and emit the next page of objects, newest first.
+    def _gallery_step(self) -> None:
+        """Read one object (and its thumbnail) and emit it.
 
-        Only the current page's ``GetObjectInfo`` (and thumbnails) are fetched,
-        so a card with thousands of files becomes usable immediately instead of
-        blocking until every object has been read.
+        Called once per worker-loop iteration while a gallery stream is active,
+        so the grid fills progressively and every other job keeps getting a
+        turn between objects.
         """
-        if self.client is None:
+        if not self._gallery_loading or self.client is None:
+            return
+        if self._gallery_index >= len(self._gallery_handles):
+            self._finish_gallery()
             return
 
-        objects: list[CameraObject] = []
-        while self._gallery_index < len(self._gallery_handles) and not objects:
-            end = self._gallery_index + GALLERY_BATCH_SIZE
-            page = self._gallery_handles[self._gallery_index : end]
-            self._gallery_index += len(page)
-            for handle in page:
+        handle = self._gallery_handles[self._gallery_index]
+        self._gallery_index += 1
+        try:
+            obj = self.client.get_object_info(handle)
+        except (CameraError, TransportError):
+            return  # skip this one and carry on with the next
+        if obj.is_image or obj.is_movie:
+            self.objectsLoaded.emit([obj])
+            self._gallery_shown += 1
+            if obj.is_image:
                 try:
-                    obj = self.client.get_object_info(handle)
-                except (CameraError, TransportError):
-                    continue
-                if obj.is_image or obj.is_movie:
-                    objects.append(obj)
+                    thumbnail = self.client.get_thumbnail(obj.handle)
+                except Exception:  # noqa: BLE001 - one bad object must not stop the rest
+                    thumbnail = b""
+                if thumbnail:
+                    self.thumbnailReady.emit(obj.handle, thumbnail)
 
-        if objects:
-            self.objectsLoaded.emit(objects)
-            self._load_thumbnails(objects)
-
-        more = self._gallery_index < len(self._gallery_handles)
-        self.hasMoreObjects.emit(more)
-        total = len(self._gallery_handles)
-        if more:
-            self.statusChanged.emit(
-                f"Showing {self._gallery_index} of {total} items — older photos can be loaded"
-            )
-        else:
-            self.statusChanged.emit(f"{total} items on camera")
-
-    def _load_thumbnails(self, objects: list[CameraObject]) -> None:
-        if self.client is None:
+        if self._gallery_index >= len(self._gallery_handles):
+            self._finish_gallery()
             return
-        for obj in objects:
-            if not obj.is_image:
-                continue
-            try:
-                thumbnail = self.client.get_thumbnail(obj.handle)
-            except Exception:  # noqa: BLE001 - one bad object must not stop the rest
-                continue
-            if thumbnail:
-                self.thumbnailReady.emit(obj.handle, thumbnail)
+
+        self.galleryProgress.emit(self._gallery_shown, len(self._gallery_handles))
+        if self._gallery_index % 10 == 0:
+            self.statusChanged.emit(
+                f"Loading photos… {self._gallery_index} of {len(self._gallery_handles)}"
+            )
+
+    def _finish_gallery(self) -> None:
+        self._gallery_loading = False
+        total = len(self._gallery_handles)
+        self.galleryProgress.emit(self._gallery_shown, total)
+        self.statusChanged.emit(f"{self._gallery_shown} items on camera")
 
     def _do_set_property(self, code: int, value: int) -> None:
         if self.client is None:

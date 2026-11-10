@@ -72,7 +72,11 @@ def test_gui_live_view_and_capture(qapp, tmp_path):
     try:
         window.connection_bar.set_host(f"127.0.0.1:{server.port}")
         window._connect()
-        assert _pump(qapp, lambda: window.gallery.list.count() > 0, timeout=20.0)
+        assert _pump(
+            qapp,
+            lambda: window.gallery.list.count() > 0 and not window.worker._gallery_loading,
+            timeout=20.0,
+        )
 
         before = window.gallery.list.count()
         window.worker.capture()
@@ -430,14 +434,20 @@ def test_capture_waits_for_the_new_file(qapp):
     # Simulate the camera taking a moment to write the file to the card.
     server.state.capture_delay_seconds = 1.2
     worker = CameraWorker("test", bytes(16))
+    loaded: list = []
+    worker.objectsLoaded.connect(loaded.extend)
     try:
         worker._do_connect(f"127.0.0.1:{server.port}")
-        loaded: list = []
-        worker.objectsLoaded.connect(lambda objs: (loaded.clear(), loaded.extend(objs)))
+        while worker._gallery_loading:
+            worker._gallery_step()
+        loaded.clear()
 
         start = time.monotonic()
         worker._do_capture()
         elapsed = time.monotonic() - start
+
+        while worker._gallery_loading:
+            worker._gallery_step()
 
         assert elapsed >= 1.0  # it waited for the file instead of refreshing immediately
         assert len(loaded) == 5  # 4 sample images + the new capture

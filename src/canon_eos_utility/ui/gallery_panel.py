@@ -124,8 +124,6 @@ class GalleryPanel(QWidget):
     refreshRequested = Signal()
     #: Emitted with a list of object handles to delete from the camera.
     deleteRequested = Signal(object)
-    #: Emitted when the user asks for the next page of older objects.
-    loadMoreRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -175,15 +173,6 @@ class GalleryPanel(QWidget):
         self.list.itemSelectionChanged.connect(self._update_delete_enabled)
         self.list.itemChanged.connect(lambda _item: self._update_delete_enabled())
         layout.addWidget(self.list, 1)
-
-        more_row = QHBoxLayout()
-        more_row.addStretch(1)
-        self.load_more_button = QPushButton("Load older photos")
-        self.load_more_button.setVisible(False)
-        self.load_more_button.clicked.connect(self._request_more)
-        more_row.addWidget(self.load_more_button)
-        more_row.addStretch(1)
-        layout.addLayout(more_row)
 
         actions_row = QHBoxLayout()
         self.delete_button = QPushButton("Delete")
@@ -239,15 +228,13 @@ class GalleryPanel(QWidget):
         self.list.clear()
         self._items.clear()
         self.summary_label.setText("Not connected")
-        self.set_more_available(False)
         self._update_delete_enabled()
 
     def begin_load(self) -> None:
-        """Clear the gallery before a fresh page of results arrives."""
+        """Clear the gallery before new results stream in."""
         self.list.clear()
         self._items.clear()
         self.summary_label.setText("Reading camera contents…")
-        self.set_more_available(False)
         self._update_delete_enabled()
 
     def add_objects(self, objects: list[CameraObject]) -> None:
@@ -279,10 +266,12 @@ class GalleryPanel(QWidget):
             self._items[obj.handle] = item
         self.summary_label.setText(f"{self.list.count()} objects")
 
-    def set_more_available(self, more: bool) -> None:
-        """Show (or hide) the "load older photos" control for the next page."""
-        self.load_more_button.setVisible(more)
-        self.load_more_button.setEnabled(True)
+    def set_counts(self, shown: int, total: int) -> None:
+        """Update the summary line while the gallery streams in."""
+        if total:
+            self.summary_label.setText(f"Showing {shown} of {total} items")
+        else:
+            self.summary_label.setText("0 objects")
 
     def set_objects(self, objects: list[CameraObject]) -> None:
         self.begin_load()
@@ -338,10 +327,6 @@ class GalleryPanel(QWidget):
         state = Qt.Checked if checked else Qt.Unchecked
         for index in range(self.list.count()):
             self.list.item(index).setCheckState(state)
-
-    def _request_more(self) -> None:
-        self.load_more_button.setEnabled(False)
-        self.loadMoreRequested.emit()
 
     def _download_selected(self) -> None:
         handles = self.selected_handles()

@@ -20,43 +20,43 @@ def qapp():
     yield app
 
 
-def test_worker_pages_the_gallery(qapp, monkeypatch):
+def test_worker_streams_the_gallery(qapp):
     import canon_eos_utility.ui.camera_worker as cw
-
-    monkeypatch.setattr(cw, "GALLERY_BATCH_SIZE", 2)
 
     server = MockCameraServer(port=0)
     server.start()
     worker = cw.CameraWorker("test", bytes(16))
 
-    batches: list[list] = []
-    more: list[bool] = []
+    objects: list = []
+    progress: list[tuple[int, int]] = []
     resets: list[bool] = []
-    worker.objectsLoaded.connect(lambda objs: batches.append(list(objs)))
-    worker.hasMoreObjects.connect(more.append)
+    worker.objectsLoaded.connect(lambda objs: objects.extend(objs))
+    worker.galleryProgress.connect(lambda shown, total: progress.append((shown, total)))
     worker.galleryReset.connect(lambda: resets.append(True))
 
     try:
+        # Direct-drive the worker (no thread): connect streams the first object,
+        # then we step through the rest exactly as the worker loop would.
         worker._do_connect(f"127.0.0.1:{server.port}")
+        while worker._gallery_loading:
+            worker._gallery_step()
 
         # Newest first: the highest handle (IMG_0004) leads.
-        assert len(batches) == 1
-        assert [obj.filename for obj in batches[0]] == ["IMG_0004.JPG", "IMG_0003.JPG"]
-        assert more == [True]
-
-        worker._do_load_more()
-        assert [obj.filename for obj in batches[1]] == ["IMG_0002.JPG", "IMG_0001.JPG"]
-        assert more == [True, False]
-
-        # Once everything is shown further requests are no-ops.
-        worker._do_load_more()
-        assert len(batches) == 2
+        assert [obj.filename for obj in objects] == [
+            "IMG_0004.JPG",
+            "IMG_0003.JPG",
+            "IMG_0002.JPG",
+            "IMG_0001.JPG",
+        ]
         assert resets == [True]
+        assert progress[0] == (0, 4)
+        assert progress[-1] == (4, 4)
+        assert not worker._gallery_loading
     finally:
         server.stop()
 
 
-def test_gallery_panel_appends_and_toggles_load_more(qapp):
+def test_gallery_panel_appends_and_reports_counts(qapp):
     from canon_eos_utility.models import CameraObject
     from canon_eos_utility.ui.gallery_panel import GalleryPanel
 
@@ -66,19 +66,17 @@ def test_gallery_panel_appends_and_toggles_load_more(qapp):
 
     panel.begin_load()
     assert panel.list.count() == 0
-    assert panel.load_more_button.isHidden()
+    assert panel.summary_label.text() == "Reading camera contents…"
 
     panel.add_objects(first)
+    panel.set_counts(1, 10)
     assert panel.list.count() == 1
-    assert panel.summary_label.text() == "1 objects"
-
-    panel.set_more_available(True)
-    assert not panel.load_more_button.isHidden()
+    assert panel.summary_label.text() == "Showing 1 of 10 items"
 
     panel.add_objects(second)
     panel.add_objects(second)  # a duplicate handle is ignored
     assert panel.list.count() == 2
     assert panel.all_handles() == [2, 1]
 
-    panel.set_more_available(False)
-    assert panel.load_more_button.isHidden()
+    panel.set_counts(2, 2)
+    assert panel.summary_label.text() == "Showing 2 of 2 items"
