@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 #: Reverse-DNS application id (matches the .desktop file / Flatpak app id).
 APP_ID = "org.problem_child.CanonEOSUtility"
